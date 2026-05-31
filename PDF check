@@ -1,0 +1,105 @@
+import subprocess, sys
+for p in ["requests","beautifulsoup4","lxml"]:
+    subprocess.check_call([sys.executable,"-m","pip","install",p,"-q"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+import requests, re, json
+from bs4 import BeautifulSoup
+from datetime import datetime, timedelta, timezone
+
+ETF_CODE = "0000J0"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+def kst_now():
+    return datetime.now(timezone.utc) + timedelta(hours=9)
+
+today     = kst_now().date()
+yesterday = today - timedelta(days=1)
+while yesterday.weekday() >= 5:
+    yesterday -= timedelta(days=1)
+
+TARGET = yesterday.strftime("%Y%m%d")
+print(f"오늘(KST): {today}  /  조회 목표: {TARGET}\n")
+
+BASE = f"https://navercomp.wisereport.co.kr/v2/ETF/index.aspx?cmp_cd={ETF_CODE}"
+sess = requests.Session()
+sess.headers["User-Agent"] = UA
+
+def get_dates(html):
+    return sorted(set(re.findall(r'TRD_DT[\":\s]+([0-9\-]{8,10})', html)))
+
+# STEP 1: 기본 페이지
+print("=" * 55)
+print("STEP 1. 기본 페이지")
+r0 = sess.get(BASE, timeout=15)
+print(f"  상태: {r0.status_code}  grid_data: {'있음' if 'grid_data' in r0.text else '없음'}")
+print(f"  날짜: {get_dates(r0.text)}")
+
+m = re.search(r"var\s+chart_data\s*=\s*(\[[\s\S]*?\])\s*;", r0.text)
+if m:
+    try:
+        cd = json.loads(m.group(1))
+        keys = list(cd[0].keys()) if cd else []
+        chart_dates = sorted(set(d.get("TRD_DT","") for d in cd))
+        print(f"  chart_data 키: {keys}")
+        print(f"  chart_data 날짜: {chart_dates}")
+    except Exception as e:
+        print(f"  chart_data 파싱 오류: {e}")
+else:
+    print("  chart_data 없음")
+
+# STEP 2: GET 파라미터 시도
+print("\n" + "=" * 55)
+print(f"STEP 2. GET 파라미터로 {TARGET} 조회")
+d = datetime.strptime(TARGET, "%Y%m%d")
+found_get = None
+for param, val in [
+    ("selDate", d.strftime("%Y-%m-%d")),
+    ("selDate", TARGET),
+    ("selDate", d.strftime("%Y.%m.%d")),
+    ("trd_dt",  TARGET),
+    ("trdDd",   TARGET),
+    ("date",    d.strftime("%Y-%m-%d")),
+]:
+    try:
+        r = sess.get(f"{BASE}&{param}={val}", timeout=10)
+        dates = get_dates(r.text)
+        hit = TARGET in [dd.replace("-","") for dd in dates]
+        mark = "OK" if hit else ("??" if dates else "NO")
+        print(f"  [{mark}] {param}={val:<14} => {r.status_code} 날짜:{dates}")
+        if hit and found_get is None:
+            found_get = (param, val)
+    except Exception as e:
+        print(f"  [ER] {param}={val} => {e}")
+
+# STEP 3: POST 시도
+print("\n" + "=" * 55)
+print(f"STEP 3. POST로 {TARGET} 조회")
+found_post = None
+for body in [
+    {"selDate": d.strftime("%Y-%m-%d")},
+    {"selDate": TARGET},
+    {"trd_dt" : TARGET},
+]:
+    try:
+        r = sess.post(BASE, data=body, timeout=10)
+        dates = get_dates(r.text)
+        hit = TARGET in [dd.replace("-","") for dd in dates]
+        mark = "OK" if hit else ("??" if dates else "NO")
+        print(f"  [{mark}] POST {body} => {r.status_code} 날짜:{dates}")
+        if hit and found_post is None:
+            found_post = body
+    except Exception as e:
+        print(f"  [ER] POST {body} => {e}")
+
+# 결과
+print("\n" + "=" * 55)
+print("결과 요약")
+if found_get:
+    print(f"  GET 성공: ?{found_get[0]}={found_get[1]}")
+elif found_post:
+    print(f"  POST 성공: {found_post}")
+else:
+    print("  직접 조회 불가 -> 캐시 방식 사용 필요")
+
+# 이 코드는 t-2 영업일 과 t-1 에 etf pdf 단위증권수 변동이 없었는지 체크하는건데, google co lab 에서 t-2는 가끔 불러오지 않는 에러가 있어서, 이걸 고쳐줘. 해당 영업일 스냅샷처럼 데이터를 불러와서 비교하면 안되는건가?
